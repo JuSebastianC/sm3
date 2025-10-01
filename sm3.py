@@ -1,12 +1,15 @@
-# simulador_streamlit_v2.py
+# simulador_streamlit_v3_errors.py
 import streamlit as st
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import time
+import math
+
+st.set_page_config(layout="wide", page_title="Simulador BER — con teoría y errores")
 
 # ==========================
-# Presets por tecnología
+# Presets por tecnología (informativo)
 # ==========================
 tech_presets = {
     "5G": {"Pt_dBm": 23, "freq_GHz": 3.5, "distance_m": 100, "BW_MHz": 100},
@@ -17,17 +20,17 @@ tech_presets = {
 # ==========================
 # Funciones auxiliares
 # ==========================
-def awgn_channel(x, snr_db):
-    snr_linear = 10 ** (snr_db / 10)
-    power_signal = np.mean(np.abs(x) ** 2)
-    noise_power = power_signal / snr_linear
-    noise = np.sqrt(noise_power / 2) * (np.random.randn(*x.shape))
+def awgn_channel(x, EbN0_dB, rate=1.0):
+    EbN0_lin = 10 ** (EbN0_dB / 10.0)
+    sigma2 = 1.0 / (2.0 * rate * EbN0_lin)
+    sigma = np.sqrt(sigma2)
+    noise = sigma * np.random.randn(*x.shape)
     return x + noise
 
-def rayleigh_channel(x, snr_db):
-    h = np.random.rayleigh(scale=1.0, size=x.shape)
-    x_faded = x * h
-    return awgn_channel(x_faded, snr_db)
+def rayleigh_channel(x, EbN0_dB, rate=1.0):
+    fade = np.random.rayleigh(scale=1.0, size=x.shape)
+    faded = x * fade
+    return awgn_channel(faded, EbN0_dB, rate=rate)
 
 def bpsk_mod(bits):
     return 2 * bits - 1
@@ -35,188 +38,282 @@ def bpsk_mod(bits):
 def bpsk_demod(symbols):
     return (symbols >= 0).astype(int)
 
-# Repetición 3x
+# Codificación/decodificación
 def repetition_encode(bits):
     return np.repeat(bits, 3)
 
-def repetition_decode(bits_rx):
-    reshaped = bits_rx.reshape(-1, 3)
-    return np.round(np.mean(reshaped, axis=1)).astype(int)
-
-# Hamming(7,4)
-G_hamming = np.array([
-    [1,0,0,0,1,1,0],
-    [0,1,0,0,1,0,1],
-    [0,0,1,0,1,0,0],
-    [0,0,0,1,0,1,1]
-])
-H_hamming = np.array([
-    [1,1,1,0,1,0,0],
-    [1,0,0,1,0,1,0],
-    [0,1,0,1,0,0,1]
-])
+def repetition_decode(hard_bits):
+    resh = hard_bits.reshape(-1, 3)
+    return (np.sum(resh, axis=1) >= 2).astype(int)
 
 def hamming74_encode(bits):
     bits = bits.reshape(-1, 4)
-    return (bits @ G_hamming % 2).astype(int).reshape(-1)
+    out = []
+    for d in bits:
+        d1,d2,d3,d4 = d
+        p1 = (d1 ^ d2 ^ d4) & 1
+        p2 = (d1 ^ d3 ^ d4) & 1
+        p3 = (d2 ^ d3 ^ d4) & 1
+        code = np.array([p1,p2,d1,p3,d2,d3,d4], dtype=int)
+        out.extend(code.tolist())
+    return np.array(out, dtype=int)
 
-def hamming74_decode(bits_rx):
-    bits_rx = bits_rx.reshape(-1, 7)
-    syndromes = (bits_rx @ H_hamming.T % 2)
+def hamming74_decode(hard_bits):
+    blocks = hard_bits.reshape(-1,7)
     decoded = []
-    for i, s in enumerate(syndromes):
-        syndrome_dec = s.dot(1 << np.arange(s.size)[::-1])
-        if syndrome_dec != 0 and syndrome_dec <= 7:
-            bits_rx[i, syndrome_dec-1] ^= 1
-        decoded.append(bits_rx[i][:4])
-    return np.array(decoded).reshape(-1)
+    for block in blocks:
+        p1,p2,d1,p3,d2,d3,d4 = block
+        s1 = p1 ^ d1 ^ d2 ^ d4
+        s2 = p2 ^ d1 ^ d3 ^ d4
+        s3 = p3 ^ d2 ^ d3 ^ d4
+        syndrome = (s1 << 2) | (s2 << 1) | s3
+        if syndrome != 0 and 1 <= syndrome <= 7:
+            block[syndrome-1] ^= 1
+        decoded.extend([block[2], block[4], block[5], block[6]])
+    return np.array(decoded, dtype=int)
 
-# Convolucional (K=3, polinomios [7,5] en octal)
 def conv_encode(bits):
-    g1, g2 = 0b111, 0b101
+    g1 = 0b111
+    g2 = 0b101
+    K = 3
     state = 0
-    encoded = []
+    out = []
     for b in bits:
-        state = ((state << 1) | b) & 0b111
-        out1 = bin(state & g1).count("1") % 2
-        out2 = bin(state & g2).count("1") % 2
-        encoded.extend([out1, out2])
-    return np.array(encoded)
+        state = ((state << 1) | int(b)) & ((1 << K) - 1)
+        o1 = bin(state & g1).count("1") % 2
+        o2 = bin(state & g2).count("1") % 2
+        out.extend([o1, o2])
+    for _ in range(K-1):
+        state = ((state << 1) | 0) & ((1 << K) - 1)
+        o1 = bin(state & g1).count("1") % 2
+        o2 = bin(state & g2).count("1") % 2
+        out.extend([o1, o2])
+    return np.array(out, dtype=int)
 
-def viterbi_decode(bits_rx):
-    n = len(bits_rx) // 2
-    trellis = {0: (0, [])}
-    g1, g2 = 0b111, 0b101
-    for i in range(n):
-        new_trellis = {}
-        for state, (metric, path) in trellis.items():
-            for bit in [0, 1]:
-                next_state = ((state << 1) | bit) & 0b111
-                out1 = bin(next_state & g1).count("1") % 2
-                out2 = bin(next_state & g2).count("1") % 2
-                expected = np.array([out1, out2])
-                received = bits_rx[2*i:2*i+2]
-                branch_metric = np.sum(expected != received)
-                new_metric = metric + branch_metric
-                if next_state not in new_trellis or new_metric < new_trellis[next_state][0]:
-                    new_trellis[next_state] = (new_metric, path + [bit])
-        trellis = new_trellis
-    best_state = min(trellis, key=lambda s: trellis[s][0])
-    return np.array(trellis[best_state][1])
+def viterbi_decode(hard_bits):
+    n = len(hard_bits)//2
+    K = 3
+    n_states = 1 << (K-1)
+    g1 = 0b111
+    g2 = 0b101
+    trellis = {}
+    for s in range(n_states):
+        trellis[s] = []
+        for b in [0,1]:
+            next_state = ((s << 1) | b) & ((1 << (K-1)) - 1)
+            full_state = ((s << 1) | b) & ((1 << K) - 1)
+            o1 = bin(full_state & g1).count("1") % 2
+            o2 = bin(full_state & g2).count("1") % 2
+            trellis[s].append((next_state, np.array([o1,o2]), b))
+    INF = 1e9
+    path_metric = np.full((n+1, n_states), INF)
+    path_bits = [[None]*n_states for _ in range(n+1)]
+    path_metric[0,0] = 0
+    path_bits[0][0] = []
+    for t in range(n):
+        r = hard_bits[2*t:2*t+2]
+        for s in range(n_states):
+            if path_bits[t][s] is None:
+                continue
+            for (ns, expected, b) in trellis[s]:
+                metric = np.sum(expected != r)
+                nm = path_metric[t,s] + metric
+                if nm < path_metric[t+1, ns]:
+                    path_metric[t+1, ns] = nm
+                    path_bits[t+1][ns] = (path_bits[t][s] or []) + [b]
+    end_state = int(np.argmin(path_metric[n]))
+    decoded = np.array(path_bits[n][end_state], dtype=int)
+    decoded = decoded[:-(K-1)] if K-1 > 0 else decoded
+    return decoded
 
-# Simulación con diferentes esquemas
-def simulate_scheme(N_bits, EbN0_dB_range, channel_type, scheme, seed):
+# Teórico BPSK
+def ber_bpsk_theoretical(EbN0_dB_array):
+    out = []
+    for d in EbN0_dB_array:
+        Eb_lin = 10**(d/10.0)
+        val = 0.5 * math.erfc(math.sqrt(Eb_lin))
+        out.append(val)
+    return np.array(out)
+
+def simulate_scheme(N_bits, EbN0_list, channel, scheme, seed):
     np.random.seed(seed)
-    ber_list = []
-    start_time = time.time()
-
-    for EbN0_dB in EbN0_dB_range:
-        bits_tx = np.random.randint(0, 2, N_bits)
-
+    bers = []
+    times = []
+    if scheme == "Sin codificar":
+        rate = 1.0
+    elif scheme == "Repetición 3x":
+        rate = 1.0/3.0
+    elif scheme == "Hamming(7,4)":
+        rate = 4.0/7.0
+    elif scheme == "Convolucional (K=3)":
+        rate = 1.0/2.0
+    else:
+        rate = 1.0
+    for Eb in EbN0_list:
+        start = time.time()
+        bits_tx = np.random.randint(0,2, N_bits)
         if scheme == "Sin codificar":
             symbols = bpsk_mod(bits_tx)
         elif scheme == "Repetición 3x":
-            coded = repetition_encode(bits_tx)
-            symbols = bpsk_mod(coded)
+            enc = repetition_encode(bits_tx)
+            symbols = bpsk_mod(enc)
         elif scheme == "Hamming(7,4)":
-            pad_len = (-len(bits_tx)) % 4
-            if pad_len: bits_tx = np.concatenate([bits_tx, np.zeros(pad_len, int)])
-            coded = hamming74_encode(bits_tx)
-            symbols = bpsk_mod(coded)
+            pad = (-len(bits_tx)) % 4
+            if pad: bits_p = np.concatenate([bits_tx, np.zeros(pad, dtype=int)])
+            else: bits_p = bits_tx
+            enc = hamming74_encode(bits_p)
+            symbols = bpsk_mod(enc)
         elif scheme == "Convolucional (K=3)":
-            coded = conv_encode(bits_tx)
-            symbols = bpsk_mod(coded)
-
-        # Canal
-        if channel_type == "AWGN":
-            rx = awgn_channel(symbols, EbN0_dB)
+            enc = conv_encode(bits_tx)
+            symbols = bpsk_mod(enc)
+        if channel == "AWGN":
+            rx = awgn_channel(symbols, Eb, rate=rate)
         else:
-            rx = rayleigh_channel(symbols, EbN0_dB)
-
-        # Decodificación
+            rx = rayleigh_channel(symbols, Eb, rate=rate)
+        hard = bpsk_demod(rx)
         if scheme == "Sin codificar":
-            bits_rx = bpsk_demod(rx)
+            bits_rx = hard
+            bits_comp = bits_tx
         elif scheme == "Repetición 3x":
-            hard = bpsk_demod(rx)
             bits_rx = repetition_decode(hard)
+            bits_comp = bits_tx
         elif scheme == "Hamming(7,4)":
-            hard = bpsk_demod(rx)
-            bits_rx = hamming74_decode(hard)[:N_bits]
+            dec = hamming74_decode(hard)
+            bits_rx = dec[:len(bits_tx)]
+            bits_comp = bits_tx
         elif scheme == "Convolucional (K=3)":
-            hard = bpsk_demod(rx)
-            bits_rx = viterbi_decode(hard)[:N_bits]
+            dec = viterbi_decode(hard)
+            bits_rx = dec[:len(bits_tx)]
+            bits_comp = bits_tx
+        else:
+            bits_rx = hard
+            bits_comp = bits_tx
+        errors = np.sum(bits_comp != bits_rx)
+        ber = errors / len(bits_comp)
+        bers.append(ber)
+        times.append(time.time() - start)
+    return np.array(bers), np.array(times), rate
 
-        errors = np.sum(bits_tx != bits_rx)
-        ber = errors / len(bits_tx)
-        ber_list.append(ber)
+# UI
+st.title("📡 Simulador BER — teoría y errores visualizados")
+st.sidebar.header("Parámetros")
 
-    sim_time = time.time() - start_time
-    return ber_list, sim_time
+tech = st.sidebar.selectbox("Tecnología (preset informativo)", list(tech_presets.keys()))
+preset = tech_presets[tech]
+st.sidebar.markdown("**Presets (informativo):**")
+st.sidebar.write(f"Pt = {preset['Pt_dBm']} dBm | freq = {preset['freq_GHz']} GHz | dist = {preset['distance_m']} m | BW = {preset['BW_MHz']} MHz")
 
-# ==========================
-# Interfaz Streamlit
-# ==========================
-st.title("📡 Simulador BER con técnicas de codificación")
-st.sidebar.header("Parámetros de simulación")
+Eb_min = st.sidebar.number_input("Eb/N0 inicio (dB)", value=0.0, format="%.1f")
+Eb_max = st.sidebar.number_input("Eb/N0 fin (dB)", value=8.0, format="%.1f")
+Eb_step = st.sidebar.number_input("Paso (dB)", value=1.0, format="%.1f")
+N_bits = st.sidebar.number_input("Número de bits (por punto)", value=10000, min_value=1000, step=1000)
+channel = st.sidebar.radio("Tipo de canal", ["AWGN", "Rayleigh"])
+seed = st.sidebar.number_input("Semilla (seed)", value=42)
 
-# Tecnología
-tech_choice = st.sidebar.selectbox("Tecnología", list(tech_presets.keys()))
-preset = tech_presets[tech_choice]
-st.sidebar.markdown("**Presets [Inferencia]:**")
-st.sidebar.write(f"Pt = {preset['Pt_dBm']} dBm")
-st.sidebar.write(f"Frecuencia = {preset['freq_GHz']} GHz")
-st.sidebar.write(f"Distancia = {preset['distance_m']} m")
-st.sidebar.write(f"Ancho de banda = {preset['BW_MHz']} MHz")
-
-# Parámetros ajustables
-EbN0_min = st.sidebar.number_input("Eb/N0 mínimo (dB)", value=0)
-EbN0_max = st.sidebar.number_input("Eb/N0 máximo (dB)", value=8)
-EbN0_step = st.sidebar.number_input("Paso (dB)", value=1)
-N_bits = st.sidebar.number_input("Número de bits", value=10000, min_value=1000, max_value=200000)
-channel_type = st.sidebar.radio("Tipo de canal", ["AWGN", "Rayleigh"])
-seed = st.sidebar.number_input("Semilla aleatoria", value=42)
-
-# Selección de esquemas
-schemes = st.sidebar.multiselect("Esquemas de codificación", 
-                                 ["Sin codificar", "Repetición 3x", "Hamming(7,4)", "Convolucional (K=3)"], 
+schemes = st.sidebar.multiselect("Esquemas a comparar",
+                                 ["Sin codificar", "Repetición 3x", "Hamming(7,4)", "Convolucional (K=3)"],
                                  default=["Sin codificar"])
 
-run_sim = st.sidebar.button("Ejecutar simulación")
+run = st.sidebar.button("Ejecutar simulación")
 
-# ==========================
-# Simulación
-# ==========================
-if run_sim:
-    EbN0_range = np.arange(EbN0_min, EbN0_max + 1, EbN0_step)
+col1, col2 = st.columns([2,1])
+
+if run:
+    Eb_list = np.arange(Eb_min, Eb_max + 1e-9, Eb_step)
     results = {}
-
+    times_info = {}
+    rates = {}
     for scheme in schemes:
-        ber, sim_time = simulate_scheme(N_bits, EbN0_range, channel_type, scheme, seed)
-        results[scheme] = ber
-
-    df = pd.DataFrame(results, index=EbN0_range)
+        bers, times_arr, rate = simulate_scheme(N_bits, Eb_list, channel, scheme, seed)
+        results[scheme] = bers
+        times_info[scheme] = times_arr
+        rates[scheme] = rate
+    ber_theo = ber_bpsk_theoretical(Eb_list)
+    df = pd.DataFrame(results, index=Eb_list)
     df.index.name = "Eb/N0 (dB)"
+    with col1:
+        fig, ax = plt.subplots(figsize=(8,4))
+        for scheme in schemes:
+            ax.semilogy(Eb_list, results[scheme], marker='o', label=f"{scheme} (sim.)")
+        ax.semilogy(Eb_list, ber_theo, '--', label="Teórica BPSK (AWGN)")
+        ax.set_xlabel("Eb/N0 (dB)")
+        ax.set_ylabel("BER")
+        ax.set_title(f"BER vs Eb/N0 — Canal: {channel}")
+        ax.grid(True, which='both')
+        ax.legend()
+        st.pyplot(fig)
+        st.markdown("**Interpretación rápida:**")
+        for scheme in schemes:
+            st.write(f"- **{scheme}**: tasa (R) = {rates[scheme]:.3f}. Tiempo medio = {np.mean(times_info[scheme]):.3f} s")
+    with col2:
+        st.subheader("Tabla de resultados")
+        display_df = df.reset_index().rename(columns={"index":"Eb/N0 (dB)"})
+        st.dataframe(display_df)
 
-    st.subheader("📊 Resultados")
-    st.write(f"Tiempo total de simulación: {sim_time:.2f} segundos")
-    st.dataframe(df)
+    # ==========================
+    # Visualización de errores
+    # ==========================
+    st.markdown("---")
+    st.subheader("Visualización de errores en un segmento de bits")
 
-    # Gráfica
-    fig, ax = plt.subplots()
-    for scheme in schemes:
-        ax.semilogy(df.index, df[scheme], marker='o', label=scheme)
-    ax.set_xlabel("Eb/N0 (dB)")
-    ax.set_ylabel("BER (escala log)")
-    ax.set_title(f"Curva BER - Canal {channel_type}")
-    ax.grid(True, which="both")
-    ax.legend()
-    st.pyplot(fig)
+    scheme_show = schemes[0]  # primer esquema
+    Eb_test = Eb_list[0]      # primer Eb/N0
 
-    # Descargar resultados
-    csv = df.to_csv().encode('utf-8')
-    st.download_button(
-        label="📥 Descargar resultados en CSV",
-        data=csv,
-        file_name='resultados_ber.csv',
-        mime='text/csv',
-    )
+    # Simulamos un segmento corto
+    N_vis = 50
+    bits_tx = np.random.randint(0,2, N_vis)
+
+    if scheme_show == "Sin codificar":
+        symbols = bpsk_mod(bits_tx)
+        rate = 1.0
+    elif scheme_show == "Repetición 3x":
+        enc = repetition_encode(bits_tx)
+        symbols = bpsk_mod(enc)
+        rate = 1.0/3.0
+    elif scheme_show == "Hamming(7,4)":
+        pad = (-len(bits_tx)) % 4
+        if pad: bits_p = np.concatenate([bits_tx, np.zeros(pad, dtype=int)])
+        else: bits_p = bits_tx
+        enc = hamming74_encode(bits_p)
+        symbols = bpsk_mod(enc)
+        rate = 4.0/7.0
+    elif scheme_show == "Convolucional (K=3)":
+        enc = conv_encode(bits_tx)
+        symbols = bpsk_mod(enc)
+        rate = 1.0/2.0
+
+    if channel == "AWGN":
+        rx = awgn_channel(symbols, Eb_test, rate=rate)
+    else:
+        rx = rayleigh_channel(symbols, Eb_test, rate=rate)
+
+    hard = bpsk_demod(rx)
+
+    if scheme_show == "Sin codificar":
+        bits_rx = hard
+        bits_comp = bits_tx
+    elif scheme_show == "Repetición 3x":
+        bits_rx = repetition_decode(hard)
+        bits_comp = bits_tx
+    elif scheme_show == "Hamming(7,4)":
+        dec = hamming74_decode(hard)
+        bits_rx = dec[:len(bits_tx)]
+        bits_comp = bits_tx
+    elif scheme_show == "Convolucional (K=3)":
+        dec = viterbi_decode(hard)
+        bits_rx = dec[:len(bits_tx)]
+        bits_comp = bits_tx
+
+    fig2, ax2 = plt.subplots(figsize=(10,2))
+    ax2.plot(bits_comp[:N_vis], 'bo-', label="Bits transmitidos")
+    ax2.plot(bits_rx[:N_vis], 'rx--', label="Bits recibidos")
+    for i in range(N_vis):
+        if bits_comp[i] != bits_rx[i]:
+            ax2.axvspan(i-0.2, i+0.2, color="red", alpha=0.3)  # marcar error
+    ax2.set_ylim(-0.5,1.5)
+    ax2.set_xlabel("Índice de bit")
+    ax2.set_ylabel("Valor")
+    ax2.set_title(f"Errores en un segmento de {N_vis} bits — Esquema: {scheme_show}")
+    ax2.legend()
+    st.pyplot(fig2)
+
